@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>NusaTV for Android TV — D-pad-first live TV</title>
+<meta name="description" content="NusaTV for Android TV: a remote-first live TV app built with TenunJS. 164 verified channels in collapsible category groups, fullscreen zapping, CH+/CH− channel keys. Free APK." />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%2308090b'/%3E%3Ctext x='6' y='22' font-family='monospace' font-weight='700' font-size='13' fill='%23fff'%3ENU%3C/text%3E%3Crect x='19' y='9' width='8' height='8' rx='2' fill='%230e6bff'/%3E%3C/svg%3E" />
+<style>
+  :root {
+    --ink: #08090b; --panel: #121417; --raised: #1a1e24; --line: #242931;
+    --fg: #f4f6f8; --mute: #8b949f; --dim: #5c646e;
+    --signal: #0e6bff; --signal-lt: #4e95ff; --live: #ff3b30;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--ink); color: var(--fg);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.6; -webkit-font-smoothing: antialiased;
+  }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 0 20px; }
+
+  nav { position: sticky; top: 0; z-index: 10; backdrop-filter: blur(12px);
+        background: color-mix(in srgb, var(--ink) 85%, transparent);
+        border-bottom: 1px solid var(--line); }
+  nav .wrap { display: flex; align-items: center; justify-content: space-between; height: 60px; }
+  .brand { display: flex; align-items: center; gap: 8px; font-weight: 800; letter-spacing: -0.03em; font-size: 20px; }
+  .brand .tv { background: var(--signal); color: #fff; border-radius: 4px; padding: 2px 7px; font-size: 14px; }
+  nav a.cta { text-decoration: none; font-size: 13px; font-weight: 600; color: var(--fg);
+              background: var(--signal); padding: 9px 16px; border-radius: 8px; transition: filter .15s; }
+  nav a.cta:hover { filter: brightness(1.15); }
+
+  header { padding: 72px 0 48px; text-align: center; position: relative; overflow: hidden; }
+  header::before { content: ""; position: absolute; inset: -40% -20% auto; height: 130%;
+    background: radial-gradient(ellipse at 50% 0%, rgba(14,107,255,.22), transparent 60%); pointer-events: none; }
+  .pill { display: inline-flex; align-items: center; gap: 8px; font-size: 11px; letter-spacing: .12em;
+          text-transform: uppercase; color: var(--signal-lt); border: 1px solid color-mix(in srgb, var(--signal) 45%, transparent);
+          border-radius: 99px; padding: 6px 14px; background: color-mix(in srgb, var(--signal) 10%, transparent); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--live); animation: blink 1.6s ease-in-out infinite; }
+  @keyframes blink { 50% { opacity: .35; } }
+  h1 { font-size: clamp(34px, 6.5vw, 58px); font-weight: 900; letter-spacing: -0.04em; line-height: 1.05; margin: 22px 0 14px; }
+  h1 em { font-style: normal; color: var(--signal-lt); }
+  .sub { color: var(--mute); max-width: 58ch; margin: 0 auto 30px; font-size: clamp(15px, 2.2vw, 18px); }
+  .btns { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; }
+  .btn { display: inline-flex; align-items: center; gap: 9px; text-decoration: none; font-weight: 700;
+         padding: 14px 24px; border-radius: 10px; font-size: 15px; transition: transform .12s, filter .15s; }
+  .btn:hover { transform: translateY(-1px); filter: brightness(1.12); }
+  .btn.primary { background: var(--signal); color: #fff; box-shadow: 0 12px 34px -12px rgba(14,107,255,.8); }
+  .btn.ghost { background: var(--raised); color: var(--fg); border: 1px solid var(--line); }
+  .fineprint { margin-top: 18px; font-size: 12px; color: var(--dim); }
+
+  /* the remote diagram */
+  .remote { margin: 52px auto 0; max-width: 640px; background: var(--panel); border: 1px solid var(--line);
+            border-radius: 16px; padding: 26px; text-align: left; }
+  .remote h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .14em; color: var(--dim); margin-bottom: 16px; }
+  .keyrow { display: flex; flex-wrap: wrap; gap: 10px; }
+  .key { display: inline-flex; align-items: center; gap: 8px; background: var(--raised);
+         border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; font-size: 13.5px; }
+  .key kbd { font-family: ui-monospace, monospace; font-size: 12px; background: var(--ink);
+             border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 6px; padding: 3px 8px; color: var(--signal-lt); }
+
+  section { padding: 56px 0; border-top: 1px solid var(--line); }
+  h2 { font-size: clamp(24px, 4vw, 34px); font-weight: 900; letter-spacing: -0.03em; margin-bottom: 8px; }
+  .lead { color: var(--mute); max-width: 62ch; margin-bottom: 34px; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  @media (max-width: 860px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 20px; }
+  .card .ico { width: 38px; height: 38px; border-radius: 10px; display: flex; align-items: center;
+               justify-content: center; background: color-mix(in srgb, var(--signal) 16%, transparent);
+               color: var(--signal-lt); margin-bottom: 14px; }
+  .card h3 { font-size: 15.5px; font-weight: 700; margin-bottom: 6px; }
+  .card p { font-size: 13.5px; color: var(--mute); }
+
+  ol.steps { list-style: none; counter-reset: s; display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  @media (max-width: 760px) { ol.steps { grid-template-columns: 1fr; } }
+  ol.steps li { counter-increment: s; background: var(--panel); border: 1px solid var(--line);
+                border-radius: 14px; padding: 20px; position: relative; }
+  ol.steps li::before { content: counter(s, decimal-leading-zero); position: absolute; top: 18px; right: 18px;
+    font-family: ui-monospace, monospace; font-size: 13px; color: var(--dim); }
+  ol.steps h3 { font-size: 14.5px; margin-bottom: 5px; }
+  ol.steps p { font-size: 13px; color: var(--mute); }
+
+  footer { border-top: 1px solid var(--line); padding: 34px 0 46px; color: var(--dim); font-size: 13px; }
+  footer .wrap { display: flex; flex-wrap: wrap; gap: 14px; justify-content: space-between; align-items: center; }
+  footer a { color: var(--mute); text-decoration: none; }
+  footer a:hover { color: var(--fg); }
+  .legal { max-width: 72ch; margin-top: 14px; font-size: 11.5px; line-height: 1.7; }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <div class="brand">NU <span class="tv">TV</span> <span style="font-size:12px;color:var(--dim);font-weight:600">for Android TV</span></div>
+    <a class="cta" href="https://github.com/ther12k/tvbit/releases/download/tv-v0.1.1/NusaTV-AndroidTV-v0.1.1.apk">Download APK</a>
+  </div>
+</nav>
+
+<header class="wrap">
+  <span class="pill"><span class="dot"></span> TenunJS app · TN-196 · leanback</span>
+  <h1>The couch-friendly <em>NusaTV</em>.</h1>
+  <p class="sub">
+    The same 164 verified channels as <a href="https://tv.rizeva.my.id/" style="color:var(--signal-lt)">tv.rizeva.my.id</a>,
+    rebuilt native for Android TV with a remote-first accordion sidebar — no mouse, no touchscreen, just the D-pad.
+  </p>
+  <div class="btns">
+    <a class="btn primary" href="https://github.com/ther12k/tvbit/releases/download/tv-v0.1.1/NusaTV-AndroidTV-v0.1.1.apk">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      Download APK · v0.1.1
+    </a>
+    <a class="btn ghost" href="https://tv.rizeva.my.id/">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.14v14l11-7-11-7z"/></svg>
+      Or watch in the browser
+    </a>
+  </div>
+  <p class="fineprint">Debug-signed sideload build · source: <a href="https://github.com/ther12k/tvbit" style="color:var(--mute)">github.com/ther12k/tvbit</a> · framework: <a href="https://github.com/ther12k/tenunjs" style="color:var(--mute)">TenunJS</a></p>
+
+  <div class="remote">
+    <h3>The whole remote, that's the whole manual</h3>
+    <div class="keyrow">
+      <span class="key"><kbd>↑</kbd><kbd>↓</kbd> browse groups + channels</span>
+      <span class="key"><kbd>OK</kbd> collapse group / watch fullscreen</span>
+      <span class="key"><kbd>←</kbd> back to browse</span>
+      <span class="key"><kbd>CH+</kbd><kbd>CH−</kbd> zap while watching</span>
+    </div>
+  </div>
+</header>
+
+<section id="features">
+  <div class="wrap">
+    <h2>Built for the ten-foot couch</h2>
+    <p class="lead">Every interaction is D-pad-native — the accordion category sidebar mirrors the web app's channel list, translated for a remote.</p>
+    <div class="grid">
+      <div class="card">
+        <div class="ico"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="18" rx="1"/><path d="M14 3h7v5h-7zM14 12h7v9h-7z"/></svg></div>
+        <h3>Accordion channel sidebar</h3>
+        <p>12 collapsible categories walked with ↑↓ — the on-air group carries a live marker, and the cursor auto-scrolls to whatever is playing.</p>
+      </div>
+      <div class="card">
+        <div class="ico"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="m17 2-5 5-5-5"/></svg></div>
+        <h3>Fullscreen zap flow</h3>
+        <p>OK expands the video edge-to-edge; CH+/CH− or ↑↓ flips channels without leaving fullscreen. Any other key drops back to browse with playback intact.</p>
+      </div>
+      <div class="card">
+        <div class="ico"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4M5 9h14l-1.5 12.5a1 1 0 0 1-1 .5h-9a1 1 0 0 1-1-.5L5 9z"/></svg></div>
+        <h3>Fail-visible playback</h3>
+        <p>A dead stream shows its reason on screen — never a silent black box. Load any m3u you own from the Settings screen over the IME.</p>
+      </div>
+      <div class="card">
+        <div class="ico"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h10a2 2 0 0 1 2 2v12a2 2 0 0 0 2 2H6a2 2 0 0 1-2-2z"/><path d="M16 8h4v12a2 2 0 0 1-2 2"/></svg></div>
+        <h3>Bring your own playlist</h3>
+        <p>Settings fetches any m3u URL through the bounded host service and adopts it — the starter list is 164 verified-open channels.</p>
+      </div>
+      <div class="card">
+        <div class="ico"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg></div>
+        <h3>Leanback launcher</h3>
+        <p>Installs into the Android TV launcher with the leanback intent — pick it up with the remote like any other TV app.</p>
+      </div>
+      <div class="card">
+        <div class="ico"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3"/></svg></div>
+        <h3>QuickJS-native</h3>
+        <p>The UI runs as a TenunJS display-list scene on an embedded QuickJS engine — the app logic is TypeScript, the painting is native.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <h2>Install</h2>
+    <p class="lead">A debug-signed APK — sideload it from a USB stick or the TV's built-in browser.</p>
+    <ol class="steps">
+      <li><h3>Download</h3><p>Grab <span class="mono">NusaTV-AndroidTV-v0.1.1.apk</span> from the <a href="https://github.com/ther12k/tvbit/releases" style="color:var(--signal-lt)">releases page</a>.</p></li>
+      <li><h3>Allow unknown apps</h3><p>Settings → Device Preferences → Security &amp; Restrictions → Unknown sources, enabled for your file manager.</p></li>
+      <li><h3>Install &amp; watch</h3><p>Open the APK, install, launch NusaTV. First channel plays on <span class="mono">OK</span>.</p></li>
+    </ol>
+    <p style="margin-top:26px">
+      <a class="btn primary" href="https://github.com/ther12k/tvbit/releases/download/tv-v0.1.1/NusaTV-AndroidTV-v0.1.1.apk">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Download APK
+      </a>
+    </p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div>
+      <div class="brand" style="font-size:16px">NU <span class="tv">TV</span></div>
+      <p class="legal">
+        NusaTV is a generic player for publicly available streams; it bundles no credentials and
+        impersonates no client. Built on <a href="https://github.com/ther12k/tenunjs">TenunJS</a> (TN-196).
+        APK is a debug build — install at your own discretion.
+      </p>
+    </div>
+    <div style="text-align:right">
+      <p><a href="https://tv.rizeva.my.id/">tv.rizeva.my.id</a> · <a href="https://github.com/ther12k/tvbit">GitHub</a> · <a href="https://github.com/ther12k/tvbit/releases">Releases</a></p>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

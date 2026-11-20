@@ -1,6 +1,12 @@
 import type { ScreenDefinition } from "@tenunjs/core";
 import { ApplicationRuntime } from "@tenunjs/widgets";
-import { unsupportedMedia, type MediaCapability, type MediaStatus } from "@tenunjs/platform";
+import {
+  unsupportedMedia,
+  unsupportedStorage,
+  type MediaCapability,
+  type MediaStatus,
+  type StorageCapability,
+} from "@tenunjs/platform";
 import { tvTheme } from "./theme";
 import {
   DESIGN_WIDTH,
@@ -16,6 +22,7 @@ import {
   KEY_DPAD_UP,
   VIDEO_RECT,
   VIDEO_RECT_PHONE,
+  FAVORITES_GROUP,
   buildSidebarRows,
   type FocusState,
   type FormFactor,
@@ -26,6 +33,7 @@ import { PlayerScreen } from "./screens/player.screen";
 import { SettingsScreen } from "./screens/settings.screen";
 import { STARTER_PLAYLIST } from "./starter-playlist";
 import { parsePlaylist, type PlaylistEntry } from "./playlist";
+import { parseFeedText } from "./feed";
 
 // The shared layout/input constants live in the leaf module (the graph
 // gate forbids cycles); re-exported here for the public surface.
@@ -63,6 +71,28 @@ export type { FocusState, NowPlaying, LoadResult, SidebarRow } from "./layout";
 type AnyScreen = ScreenDefinition<any, any>;
 
 /**
+ * A log line that is safe on every host: the QuickJS bundle has no
+ * `console` global (the host only defines tenun_commit/tenun_host_call),
+ * so an unguarded `console.info` would throw a ReferenceError on-device.
+ * The browser preview and bun tests DO have a console, where it surfaces.
+ */
+function feedLog(message: string): void {
+  const c = (globalThis as { console?: { info?: (m: string) => void } }).console;
+  if (c && typeof c.info === "function") c.info(message);
+}
+
+/** Storage keys (the storage seam is a plain string map). */
+const FAVORITES_KEY = "favorites.v1";
+const RECENTS_KEY = "recents.v1";
+const RECENTS_MAX = 10;
+
+/** TV digit keycodes: KEYCODE_0..KEYCODE_9. */
+const KEYCODE_0 = 7;
+const KEYCODE_9 = 16;
+/** TV menu key (TiviMate's favorite toggle). */
+const KEYCODE_MENU = 82;
+
+/**
  * NusaTV runtime (TN-196): screen composition + the media seam the
  * host injects, plus the APP-LEVEL focus helper over KEY actions
  * (deliberately in-app, not framework — ADR-0028; TN-194 dispatches
@@ -98,14 +128,43 @@ const screens: Record<string, AnyScreen> = {
 /** Host-injectable seams; every gap falls closed. */
 export interface TvplayerHostServices {
   readonly media?: MediaCapability;
+  /** App-private persistence (favorites, recents). Android: the
+   *  "storage" host service; browser preview: localStorage fixture;
+   *  absent: unsupported stub — favorites/recents stay in-memory and
+   *  nothing crashes. */
+  readonly storage?: StorageCapability;
+  /** Optional JSON channel list to load at startup. Omit for offline boot. */
+  readonly feedUrl?: string;
 }
 
 export class TvplayerRuntime {
   private readonly app: ApplicationRuntime;
   private readonly media: MediaCapability;
+  private readonly storage: StorageCapability;
   private readonly form: FormFactor;
+  private readonly designWidth: number;
   private readonly videoRect: Readonly<{ x: number; y: number; w: number; h: number }>;
   private channels: readonly PlaylistEntry[] = STARTER_PLAYLIST;
+  /** Favorited channel urls (TiviMate's core list). Persisted through the
+   *  storage seam; urls are the identity so a re-sorted lineup keeps its
+   *  stars. Pruned on lineup adoption. */
+  private favorites = new Set<string>();
+  /** "★ Favorit" filter active (phone chip / TV accordion header). */
+  private favoriteOnly = false;
+  /** Recently played urls, most-recent-first, max 10 ("Lanjut Nonton").
+   *  Persisted; pruned on lineup adoption. */
+  private recents: string[] = [];
+  /** TV number-pad zap buffer ("1", "12") — flushed by timeout or on a
+   *  matching count; pushed as "zapEntry" for the on-screen bubble. */
+  private zapDigits = "";
+  private zapFlushTimer: number | null = null;
+  /** Search overlay open (screen owns the query; the runtime only tracks
+   *  open-ness so BACK closes it and the IME owns the typing keys). */
+  private searchOpenFlag = false;
+  private readonly feedUrl: string | null;
+  private readonly historyReady: Promise<void>;
+  /** Keep early star edits visible without overwriting unread history. */
+  private pendingFavoriteEdits: Map<string, boolean> | null = new Map();
   /** Phone-only group filter (the chips); the TV sidebar shows all
    *  groups at once, so this stays null on the TV form. */
   private activeGroup: string | null = null;
@@ -125,8 +184,12 @@ export class TvplayerRuntime {
   private fullscreen = false;
   private status: MediaStatus = { state: "idle" };
 
-  /** The channel list under the active group filter (phone chips). */
+  /** The channel list under the active filter (phone chips; favorites
+   *  mode overrides the group filter — it IS the filter). */
   private get vis(): readonly PlaylistEntry[] {
+    if (this.favoriteOnly) {
+      return this.channels.filter((c) => this.favorites.has(c.url));
+    }
     return this.activeGroup === null
       ? this.channels
       : this.channels.filter((c) => c.group === this.activeGroup);
@@ -151,10 +214,10 @@ export class TvplayerRuntime {
     return this.vis.findIndex((c) => c.url === this.currentUrl);
   }
 
-  /** The TV sidebar's flat walk order (the shared leaf derivation —
-   *  the screen builds the SAME rows from the pushed state). */
+  /** Same walk order as the screen: include only favorites in this lineup. */
   private flatRows() {
-    return buildSidebarRows(this.vis, this.expandedGroups);
+    const favorites = new Set(this.favoriteChannels().map((c) => c.url));
+    return buildSidebarRows(this.channels, this.expandedGroups, favorites);
   }
 
   /** The flat-row position of a channel url (-1 when hidden/collapsed). */
@@ -168,17 +231,20 @@ export class TvplayerRuntime {
    * @param formFactor "tv" (default — 960-unit 10-foot layout: icon
    *        rail, accordion sidebar, video hero) or "phone" (390-unit
    *        layout: video hero on top, the channel list below as
-   *        tappable rows). The video rect is static per session either
-   *        way (ADR-0028).
+   *        tappable rows). The native video occupies the layout's
+   *        reserved rect (ADR-0028).
    */
   constructor(
     host: TvplayerHostServices & { designWidth?: number; formFactor?: FormFactor } = {}
   ) {
-    const { media, designWidth, formFactor } = host;
+    const { media, storage, designWidth, formFactor, feedUrl } = host;
     this.media = media ?? unsupportedMedia("tvplayer: no media host bound");
+    this.storage = storage ?? unsupportedStorage("tvplayer: no storage host bound");
     this.form = formFactor ?? "tv";
+    this.designWidth = designWidth ?? (this.form === "phone" ? DESIGN_WIDTH_PHONE : DESIGN_WIDTH);
     this.videoRect = this.form === "phone" ? VIDEO_RECT_PHONE : VIDEO_RECT;
-    this.expandedGroups = new Set(this.allGroups());
+    this.expandedGroups = new Set([...this.allGroups(), FAVORITES_GROUP]);
+    this.feedUrl = feedUrl?.trim() || null;
 
     const services = {
       media: this.media,
@@ -186,13 +252,18 @@ export class TvplayerRuntime {
       loadPlaylist: (url: string) => void this.loadPlaylist(url),
       select: (index: number) => this.select(index),
       setGroup: (group: string | null) => this.setGroup(group),
+      toggleFavorite: (url: string) => this.toggleFavorite(url),
+      setFavoriteFilter: (on: boolean) => this.setFavoriteFilter(on),
+      selectUrl: (url: string) => this.selectUrl(url),
+      playToggle: () => this.playToggle(),
+      setSearchOpen: (on: boolean) => this.setSearchOpen(on),
     };
     this.app = new ApplicationRuntime({
       screens,
       initial: "player",
       theme: tvTheme,
       services: services as unknown as Record<string, unknown>,
-      designWidth: designWidth ?? (this.form === "phone" ? DESIGN_WIDTH_PHONE : DESIGN_WIDTH),
+      designWidth: this.designWidth,
     });
     this.app.pushState("form", this.form);
     this.pushChannels();
@@ -201,6 +272,188 @@ export class TvplayerRuntime {
     this.pushMedia();
     this.ensureVideoRect();
     this.startClock();
+    this.historyReady = this.hydratePersisted();
+    if (this.feedUrl !== null) void this.startFeed(this.feedUrl);
+  }
+
+  /** The starter lineup is only a placeholder for returning users. Keep
+   *  unmatched history until a real lineup is adopted. If the user acts
+   *  while storage is reading, merge their changes before writing back. */
+  private async hydratePersisted(): Promise<void> {
+    const [favorites, recents] = await Promise.all([
+      this.readPersistedUrls(FAVORITES_KEY),
+      this.readPersistedUrls(RECENTS_KEY),
+    ]);
+    const edits = this.pendingFavoriteEdits;
+    this.favorites = new Set(favorites);
+    for (const [url, starred] of edits ?? []) {
+      if (starred) this.favorites.add(url);
+      else this.favorites.delete(url);
+    }
+    const playedDuringRead = this.recents.length > 0;
+    this.recents = [...new Set([...this.recents, ...recents])].slice(0, RECENTS_MAX);
+    this.pendingFavoriteEdits = null;
+    if (edits?.size) this.persistFavorites();
+    if (playedDuringRead) this.persistRecents();
+    this.pushChannels();
+  }
+
+  private async readPersistedUrls(key: string): Promise<string[]> {
+    try {
+      const read = await this.storage.get(key);
+      if (!read.ok || typeof read.value !== "string") return [];
+      const urls: unknown = JSON.parse(read.value);
+      return Array.isArray(urls) ? urls.filter((u): u is string => typeof u === "string") : [];
+    } catch {
+      return []; // Corrupted or unavailable storage: keep the in-memory edits.
+    }
+  }
+
+  /** Write-through persistence; a storage failure degrades to in-memory. */
+  private persistFavorites(): void {
+    void this.storage.set(FAVORITES_KEY, JSON.stringify([...this.favorites])).then(() => undefined, () => undefined);
+  }
+
+  private persistRecents(): void {
+    void this.storage.set(RECENTS_KEY, JSON.stringify(this.recents)).then(() => undefined, () => undefined);
+  }
+
+  /** Drops favorites/recents that no longer resolve in the current lineup
+   *  (feed adoption / playlist load replaced the channels). */
+  private pruneAdopted(): void {
+    const urls = new Set(this.channels.map((c) => c.url));
+    for (const url of [...this.favorites]) {
+      if (!urls.has(url)) this.favorites.delete(url);
+    }
+    this.recents = this.recents.filter((url) => urls.has(url));
+  }
+
+  /** Favorites in source-list order (for the TV accordion section). */
+  favoriteChannels(): PlaylistEntry[] {
+    return this.channels.filter((c) => this.favorites.has(c.url));
+  }
+
+  isFavorite(url: string): boolean {
+    return this.favorites.has(url);
+  }
+
+  toggleFavorite(url: string): void {
+    if (this.favorites.has(url)) this.favorites.delete(url);
+    else this.favorites.add(url);
+    if (this.pendingFavoriteEdits) this.pendingFavoriteEdits.set(url, this.favorites.has(url));
+    else this.persistFavorites();
+    // A filtered view may empty out — drop the filter rather than show a
+    // blank list (the favorites section only exists when non-empty on TV).
+    if (this.favoriteOnly && this.favoriteChannels().length === 0) this.favoriteOnly = false;
+    this.pushChannels();
+    this.pushFocus();
+  }
+
+  setFavoriteFilter(on: boolean): void {
+    // Toggling ON with no favorites is a no-op (nothing to show).
+    if (on && this.favoriteChannels().length === 0) return;
+    this.favoriteOnly = on;
+    this.listIndex = 0;
+    this.pushChannels();
+    this.pushFocus();
+  }
+
+  /** Recent-zap by url (recents rail + search results): clears any group
+   *  filter so the channel is addressable, positions the cursor, zaps. */
+  selectUrl(url: string): void {
+    this.activeGroup = null;
+    this.favoriteOnly = false;
+    const index = this.vis.findIndex((c) => c.url === url);
+    if (index < 0) return;
+    if (this.form === "phone") {
+      this.listIndex = index;
+    } else {
+      this.expandedGroups.add(this.channels[index].group || "");
+      const flat = this.flatIndexOf(url);
+      if (flat >= 0) this.listIndex = flat;
+    }
+    this.zapTo(index);
+    this.pushFocus();
+  }
+
+  /** Hero tap: pause while playing, resume when paused, play the focused
+   *  row when idle. The status pill follows via MEDIA_STATE events. */
+  playToggle(): void {
+    if (this.status.state === "playing") {
+      void this.media.pause().then((r) => { if (r.ok) this.mediaPush(r.value); });
+      return;
+    }
+    if (this.status.state === "paused") {
+      void this.media.play().then((r) => { if (r.ok) this.mediaPush(r.value); });
+      return;
+    }
+    this.select(this.currentIndex >= 0 ? this.currentIndex : this.listIndex);
+  }
+
+  /** Search overlay open/close. The OPEN FLAG is runtime-owned and pushed
+   *  as the "search" channel (so BACK can close it — screen actions are
+   *  not dispatchable verbs); the QUERY stays screen-local. Opening
+   *  schedules a focus of the search field AFTER the overlay's first
+   *  commit, so the TV remote's keys land in the IME connection (the
+   *  phone keyboard opens on the same host focus path). */
+  setSearchOpen(on: boolean): void {
+    const changed = this.searchOpenFlag !== on;
+    this.searchOpenFlag = on;
+    this.app.pushState("search", on);
+    if (changed && this.form === "phone") this.ensureVideoRect();
+    if (!on) return;
+    setTimeout(() => {
+      try {
+        this.app.focusTextField("search");
+      } catch {
+        // the overlay may have closed before the timer landed — harmless
+      }
+    }, 0);
+  }
+
+  /** Fetch only an explicitly configured JSON feed; never replace a lineup
+   *  the user already imported while this request was in flight. */
+  private async startFeed(url: string): Promise<void> {
+    const fetched = await this.fetchPlaylistText(url);
+    if (!fetched.ok) {
+      feedLog(`[tvplayer] feed not adopted (${fetched.failure.message ?? fetched.failure.kind}); keeping current lineup`);
+      return;
+    }
+    const entries = parseFeedText(fetched.value);
+    if (entries === null) {
+      feedLog("[tvplayer] feed had no live channels; keeping current lineup");
+      return;
+    }
+    await this.historyReady;
+    if (this.channels === STARTER_PLAYLIST) this.adoptLineup(entries);
+  }
+
+  private async fetchPlaylistText(url: string): ReturnType<MediaCapability["fetchText"]> {
+    try {
+      return await this.media.fetchText(url);
+    } catch (error) {
+      return {
+        ok: false,
+        failure: {
+          kind: "unavailable",
+          message: error instanceof Error ? error.message : "Playlist request failed",
+        },
+      };
+    }
+  }
+
+  /** Only called for a nonempty import after persisted history has loaded. */
+  private adoptLineup(entries: readonly PlaylistEntry[]): void {
+    this.channels = entries;
+    this.activeGroup = null;
+    this.favoriteOnly = false;
+    this.currentUrl = null;
+    this.listIndex = 0;
+    this.focusZone = "list";
+    this.expandedGroups = new Set([...this.allGroups(), FAVORITES_GROUP]);
+    this.pruneAdopted();
+    this.persistFavorites();
+    this.zapTo(0); // Also records and persists post-adoption recents.
   }
 
   /**
@@ -234,6 +487,16 @@ export class TvplayerRuntime {
     return this.app.route();
   }
 
+  /** Whether the lineup is imported or the bundled starter playlist. */
+  feedSource(): "feed" | "builtin" {
+    return this.channels === STARTER_PLAYLIST ? "builtin" : "feed";
+  }
+
+  /** The explicitly configured startup URL, if any. */
+  feedSourceUrl(): string | null {
+    return this.feedUrl;
+  }
+
   routes(): readonly string[] {
     return this.app.routes();
   }
@@ -255,7 +518,9 @@ export class TvplayerRuntime {
   }
 
   navigate(route: string): void {
+    const previous = this.app.route();
     this.app.navigate(route);
+    if (this.form === "phone" && route !== previous) this.ensureVideoRect();
   }
 
   /** Plan B2 back ownership: fullscreen exits to browse first, then
@@ -264,6 +529,12 @@ export class TvplayerRuntime {
   goBack(): boolean {
     if (this.fullscreen) {
       this.exitFullscreen();
+      return true;
+    }
+    // BACK over the search overlay closes it first (the "search" push
+    // resets the screen's query through its action).
+    if (this.searchOpenFlag) {
+      this.setSearchOpen(false);
       return true;
     }
     if (this.app.route() === "settings") {
@@ -317,6 +588,34 @@ export class TvplayerRuntime {
   }
 
   private playerKey(keyCode: number): boolean {
+    // Search overlay: a focused field means the host IME connection owns
+    // the keys before they ever reach here (TenunSurfaceView routes
+    // through the InputConnection first); anything that still arrives is
+    // not typing — leave it unhandled so nothing double-acts.
+    if (this.searchOpenFlag) return false;
+    // TV favorites: MENU toggles the star on the live channel (TiviMate's
+    // menu-key pattern) — works in fullscreen and browse.
+    if (keyCode === KEYCODE_MENU) {
+      const target = this.currentUrl ?? this.vis[this.listIndex]?.url;
+      if (target) this.toggleFavorite(target);
+      return true;
+    }
+    // TV number-pad zap (TiviMate): digits accumulate into a 2-digit
+    // buffer, flushed by timeout — channel numbers are source-list
+    // positions (the same numbers the tiles show).
+    if (keyCode >= KEYCODE_0 && keyCode <= KEYCODE_9 && this.form === "tv") {
+      const digit = keyCode - KEYCODE_0;
+      this.zapDigits = (this.zapDigits + String(digit)).slice(-2);
+      this.app.pushState("zapEntry", this.zapDigits);
+      if (this.zapFlushTimer !== null) clearTimeout(this.zapFlushTimer);
+      const digits = this.zapDigits;
+      if (digits.length >= 2) {
+        this.flushZapEntry(digits);
+      } else {
+        this.zapFlushTimer = setTimeout(() => this.flushZapEntry(digits), 1200) as unknown as number;
+      }
+      return true;
+    }
     // Fullscreen playback (TV): the classic IPTV remote flow — UP/DOWN
     // and CH+/CH- zap the prev/next channel and STAY fullscreen (browse
     // without leaving the video); any OTHER key returns to the browse
@@ -367,7 +666,7 @@ export class TvplayerRuntime {
       return true;
     }
 
-    // The icon rail: UP/DOWN between [Live, Settings]; OK opens;
+    // The icon rail: UP/DOWN between [Live, Settings, Cari]; OK opens;
     // RIGHT returns to the sidebar.
     if (this.focusZone === "rail") {
       if (keyCode === KEY_DPAD_UP) {
@@ -376,12 +675,13 @@ export class TvplayerRuntime {
         return true;
       }
       if (keyCode === KEY_DPAD_DOWN) {
-        this.focusIndex = Math.min(1, this.focusIndex + 1);
+        this.focusIndex = Math.min(2, this.focusIndex + 1);
         this.pushFocus();
         return true;
       }
       if (keyCode === KEY_DPAD_CENTER || keyCode === KEYCODE_ENTER) {
         if (this.focusIndex === 1) this.navigate("settings");
+        if (this.focusIndex === 2) this.setSearchOpen(true); // pushes "search" + schedules the field focus
         return true; // Live is already the open route
       }
       if (keyCode === KEY_DPAD_RIGHT) {
@@ -500,10 +800,25 @@ export class TvplayerRuntime {
     if (next !== this.currentIndex) this.zapTo(next);
   }
 
+  /** Number-pad flush: zap to the entered channel number (1-based,
+   *  source-list position — the numbers the tiles display) and clear the
+   *  bubble. Out-of-range entries just dismiss. */
+  private flushZapEntry(digits: string): void {
+    this.zapDigits = "";
+    this.zapFlushTimer = null;
+    this.app.pushState("zapEntry", null);
+    const n = Number.parseInt(digits, 10);
+    if (!Number.isFinite(n) || n < 1 || n > this.channels.length) return;
+    const target = this.channels[n - 1];
+    if (target) this.selectUrl(target.url);
+  }
+
   /** Group selection from the UI (phone chip taps / screen action).
+   *  Clears the favorites filter — the chips are one mode at a time.
    *  The TV sidebar shows every group at once — no filter to set. */
   setGroup(group: string | null): void {
     this.activeGroup = group === null || group === "" ? null : group;
+    this.favoriteOnly = false;
     this.listIndex = 0;
     this.focusZone = "list";
     this.pushChannels();
@@ -522,6 +837,7 @@ export class TvplayerRuntime {
     const channel = this.vis[index];
     if (!channel) return;
     this.currentUrl = channel.url;
+    this.recordRecent(channel.url);
     if (this.form === "phone") {
       this.listIndex = index;
     } else {
@@ -564,11 +880,11 @@ export class TvplayerRuntime {
    *  Idempotent on the host side; re-asserted on every zap so a hot
    *  reload or viewport change can never leave the overlay stale. */
   private ensureVideoRect(): void {
-    // Fullscreen swaps the rect edge-to-edge (TV form); browse uses the
-    // layout-derived slot. Still no scene-graph overlap — the scene
-    // renders nothing while fullscreen.
-    const r =
-      this.fullscreen && this.form === "tv"
+    // The phone's native video would cover Settings and the search field.
+    // Move it out of the scene without changing the playing item.
+    const r = this.form === "phone" && (this.app.route() === "settings" || this.searchOpenFlag)
+      ? { x: 2 * this.designWidth, y: 0, w: 1, h: 1 }
+      : this.fullscreen && this.form === "tv"
         ? FULLSCREEN_RECT
         : this.videoRect;
     void this.media.setRect(r.x, r.y, r.w, r.h);
@@ -583,12 +899,10 @@ export class TvplayerRuntime {
     else this.pushFocus();
   }
 
-  /** Settings screen: fetch a playlist URL through the media seam's
-   *  bounded fetchText and adopt it as the channel list. The result is
-   *  delivered to the Settings session even if the user navigated
-   *  away (pushTo, the polytron reply pattern). */
+  /** Import M3U or JSON by content, not the URL's extension. The result
+   *  goes to the Settings session even if the user navigated away. */
   async loadPlaylist(url: string): Promise<void> {
-    const fetched = await this.media.fetchText(url);
+    const fetched = await this.fetchPlaylistText(url);
     if (!fetched.ok) {
       this.app.pushTo("settings", "loadResult", {
         ok: false,
@@ -596,7 +910,10 @@ export class TvplayerRuntime {
       } satisfies LoadResult);
       return;
     }
-    const entries = parsePlaylist(fetched.value);
+    const text = fetched.value.trimStart();
+    const entries = text.startsWith("[") || text.startsWith("{")
+      ? parseFeedText(text) ?? []
+      : parsePlaylist(text);
     if (entries.length === 0) {
       this.app.pushTo("settings", "loadResult", {
         ok: false,
@@ -604,14 +921,8 @@ export class TvplayerRuntime {
       } satisfies LoadResult);
       return;
     }
-    this.channels = entries;
-    this.activeGroup = null;
-    this.currentUrl = null;
-    this.expandedGroups = new Set(this.allGroups());
-    this.pushChannels();
-    this.zapTo(0);
-    this.focusZone = "list";
-    this.pushFocus();
+    await this.historyReady;
+    this.adoptLineup(entries);
     this.navigate("player");
     this.app.pushTo("settings", "loadResult", {
       ok: true,
@@ -625,16 +936,28 @@ export class TvplayerRuntime {
     this.pushMedia();
   }
 
+  /** "Lanjut Nonton": url to the front, dedup, cap. */
+  private recordRecent(url: string): void {
+    this.recents = [url, ...this.recents.filter((u) => u !== url)].slice(0, RECENTS_MAX);
+    if (this.pendingFavoriteEdits === null) this.persistRecents();
+    this.pushChannels();
+  }
+
   // ------------------------------------------------------------------
   // Push channels (TN-142; latest-wins, replayed on mount)
   // ------------------------------------------------------------------
 
   private pushChannels(): void {
+    const channels = this.vis;
+    const urls = new Set(channels.map((c) => c.url));
     this.app.pushState("channels", {
-      channels: this.vis,
+      channels,
       groups: this.groups(),
       activeGroup: this.activeGroup,
       expanded: [...this.expandedGroups],
+      favorites: [...this.favorites].filter((url) => urls.has(url)),
+      favoriteOnly: this.favoriteOnly,
+      recents: this.recents.filter((url) => urls.has(url)),
     });
   }
 

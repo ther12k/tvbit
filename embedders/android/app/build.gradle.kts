@@ -44,16 +44,17 @@ android {
         }
     }
 
-    // TN-195 (ADR-0028): TV packaging. The touch flavor carries NO
-    // overrides — its variants are behavior-identical to the pre-flavor
-    // build; only the task names change (assembleDebug ->
-    // assembleTouchDebug). The tv flavor re-targets the app at the 2019
-    // armeabi-v7a Mi TV: its own applicationId, a leanback entry point
-    // and banner (src/tv/AndroidManifest.xml), and the 32-bit ABI.
+    // Keep the touch reference app separate from NusaTV's phone and TV
+    // source sets. TV adds a leanback entry point and armeabi-v7a (TN-195).
     flavorDimensions += "app"
     productFlavors {
         create("touch") {
             dimension = "app"
+        }
+        create("phone") {
+            dimension = "app"
+            // Retain the application ID of the first NusaTV phone release.
+            applicationId = "id.my.tenun.embedder"
         }
         create("tv") {
             dimension = "app"
@@ -67,6 +68,10 @@ android {
             }
         }
     }
+
+    // Older NusaTV builds generated a phone asset in the touch source set.
+    // The reference flavor must use only the shared assets, even locally.
+    sourceSets.getByName("touch").assets.setSrcDirs(emptyList<String>())
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -88,7 +93,7 @@ dependencies {
     testImplementation("org.json:json:20240303")
 
     // TN-132 installed-device acceptance (androidTest): exercised only by
-    // connectedDebugAndroidTest / am instrument against a booted emulator.
+    // connectedTouchDebugAndroidTest / am instrument against a booted emulator.
     androidTestImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:core:1.6.1")

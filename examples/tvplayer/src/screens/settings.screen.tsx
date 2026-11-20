@@ -1,5 +1,5 @@
 import { defineAction, defineScreen } from "@tenunjs/core";
-import { Button, Column, Row, Scaffold, Text, TextField } from "@tenunjs/widgets";
+import { Button, Column, Scaffold, Text, TextField, Wrap } from "@tenunjs/widgets";
 import type { LoadResult } from "../layout";
 
 /**
@@ -11,12 +11,13 @@ import type { LoadResult } from "../layout";
  */
 export interface SettingsState {
   url: string;
+  loading: boolean;
   result: LoadResult | null;
 }
 
 export const SettingsScreen = defineScreen({
   name: "Settings",
-  initialState: (): SettingsState => ({ url: "", result: null }),
+  initialState: (): SettingsState => ({ url: "", loading: false, result: null }),
   actions: {
     url: defineAction<SettingsState, string>({
       run({ input, state }) {
@@ -25,17 +26,20 @@ export const SettingsScreen = defineScreen({
     }),
     loadResult: defineAction<SettingsState, LoadResult>({
       run({ input, state }) {
+        state.loading = false;
         state.result = input;
       },
     }),
     load: defineAction<SettingsState, void>({
       run({ state, services }) {
+        if (state.loading) return;
         const url = state.url.trim();
         if (url === "") {
           state.result = { ok: false, message: "enter a playlist URL first" };
           return;
         }
-        state.result = { ok: true, message: "loading…" };
+        state.loading = true;
+        state.result = null;
         (services as { loadPlaylist?: (url: string) => void }).loadPlaylist?.(url);
       },
     }),
@@ -53,9 +57,7 @@ export const SettingsScreen = defineScreen({
             Settings
           </Text>
           <Text variant="body" color="textDim">
-            Playlist URL (m3u/m3u8) — fetched through the media host's bounded fetchText
-            (GET only, 10 s timeout, 2 MB cap). Official free streams only; where you
-            point the player is your choice.
+            Load an M3U, M3U8, or JSON channel list from a URL. Use a source you’re authorized to access.
           </Text>
           <TextField
             id="playlist-url"
@@ -64,15 +66,17 @@ export const SettingsScreen = defineScreen({
             value={state.url}
             onChanged={actions.url}
           />
-          <Row gap="md">
-            <Button variant="primary" onPress={actions.load}>
+          <Wrap spacing="md" runSpacing="sm">
+            <Button variant={state.loading ? "text" : "primary"} onPress={state.loading ? undefined : actions.load}>
               Load playlist
             </Button>
             <Button variant="secondary" onPress={actions.back}>
               Back to player
             </Button>
-          </Row>
-          {state.result && (
+          </Wrap>
+          {state.loading ? (
+            <Text variant="body" color="textDim">Loading playlist…</Text>
+          ) : state.result && (
             <Text variant="body" color={state.result.ok ? "success" : "danger"}>
               {state.result.ok ? `Loaded: ${state.result.message}` : `Failed: ${state.result.message}`}
             </Text>

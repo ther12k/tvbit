@@ -7,6 +7,8 @@ local.properties
 device-acceptance-output/
 app/src/main/assets/gallery_app.js
 app/src/main/assets/polytron_app.js
+app/src/touch/assets/tvplayer_app.js
+app/src/phone/assets/tvplayer_app.js
 app/src/tv/assets/tvplayer_app.js
 app/src/main/assets/dev_server.txt
 app/src/main/assets/update_channel.json

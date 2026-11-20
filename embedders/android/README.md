@@ -82,14 +82,22 @@ cd embedders/android
 Tap a field, type with the soft keyboard, tap **Add Entry** — the entry
 appears in the list and both inputs clear.
 
-**TV flavor (TN-195):** the embedder has two product flavors — `touch`
-(the default above, behavior-identical to the pre-flavor build) and
-`tv`, which retargets the app at Android TV hardware (the 2019
-armeabi-v7a Mi TV): its own `applicationId id.my.tenun.tvplayer`, a
-LEANBACK_LAUNCHER entry point with banner (`src/tv/`), and
-`armeabi-v7a` added to the ABIs. Build it with
-`./gradlew :app:assembleTvDebug`
-(`app/build/outputs/apk/tv/debug/app-tv-debug.apk`).
+**NusaTV flavors (TN-195/TN-196):** `touch` builds the reference app above.
+`phone` builds the portrait NusaTV app under the existing phone application ID
+`id.my.tenun.embedder`, so the reference and phone APKs cannot be installed
+side by side. `tv` adds a Leanback launcher entry, banner, `armeabi-v7a`, and
+its own application ID `id.my.tenun.tvplayer`.
+
+From the repository root, generate the untracked bundles and build the APKs:
+
+```sh
+bun embedders/android/tools/gallery-bundle/build-tvplayer-apk-asset.mjs
+cd embedders/android
+./gradlew :app:assemblePhoneDebug :app:assembleTvDebug
+```
+
+The APKs are `app/build/outputs/apk/phone/debug/app-phone-debug.apk` and
+`app/build/outputs/apk/tv/debug/app-tv-debug.apk`.
 
 **Known limitation:** without `/dev/kvm` the emulator cannot complete
 Android 11 boot (software QEMU dies in `system_server`); this is an

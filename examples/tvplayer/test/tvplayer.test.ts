@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import {
   TvplayerRuntime,
   VIDEO_RECT,
+  VIDEO_RECT_PHONE,
+  DESIGN_WIDTH_PHONE,
   GAP_SM,
   HERO_W,
   PAD_SM,
@@ -14,6 +16,7 @@ import {
 } from "../src/runtime";
 import { STARTER_PLAYLIST } from "../src/starter-playlist";
 import type { MediaCapability } from "@tenunjs/platform";
+import type { DisplayListScene, SemanticNode } from "@tenunjs/widgets";
 
 /**
  * TN-196: the TvplayerRuntime headlessly — the KEY zone journeys over
@@ -74,6 +77,35 @@ function fakeMedia(opts: { fetchText?: string; fetchFails?: string } = {}): {
     },
   };
   return { media, calls };
+}
+
+/** Match the native host's topmost hit at a rendered semantic control. */
+function tapNode(runtime: TvplayerRuntime, scene: DisplayListScene, node: SemanticNode): void {
+  const { x, y, w, h } = node.bounds;
+  const cx = x + w / 2;
+  const cy = y + h / 2;
+  expect(w).toBeGreaterThan(0);
+  expect(h).toBeGreaterThan(0);
+  expect(x + w).toBeLessThanOrEqual(scene.designWidth);
+  const tap = scene.taps.findLast((t) =>
+    t.action === "tap" && cx >= t.x && cx < t.x + t.w && cy >= t.y && cy < t.y + t.h
+  );
+  const action = node.actions?.[0];
+  expect(tap).toBeDefined();
+  expect(action).toBeDefined();
+  expect(tap!.payload.id).toBe(action!.tapId);
+  runtime.dispatch(tap!.action, tap!.payload);
+}
+
+function button(scene: DisplayListScene, label: string): SemanticNode {
+  const node = scene.semantics?.nodes.find((n) => n.role === "button" && n.label === label);
+  expect(node).toBeDefined();
+  return node!;
+}
+
+function pressButton(runtime: TvplayerRuntime, label: string): void {
+  const { scene } = runtime.render();
+  tapNode(runtime, scene, button(scene, label));
 }
 
 /** Every text string the committed scene paints. */
@@ -396,23 +428,105 @@ describe("TN-196 phone form factor", () => {
     expect(textsInclude(texts, FIRST.title)).toBe(true); // the first row below the video
   });
 
+  test.each([DESIGN_WIDTH_PHONE, 320])("phone at %i units: the header opens Settings by touch and Back restores video", async (designWidth) => {
+    const { media, calls } = fakeMedia();
+    const runtime = new TvplayerRuntime({ media, formFactor: "phone", designWidth });
+    runtime.zapTo(0);
+    await settle();
+    calls.length = 0;
+
+    const { scene } = runtime.render();
+    const settings = button(scene, "Settings");
+    const search = scene.semantics?.nodes.find((node) => node.label === "⌕");
+    expect(search?.actions?.[0]?.name).toBe("press");
+    expect(settings.bounds.x).toBeGreaterThanOrEqual(search!.bounds.x + search!.bounds.w);
+    expect(settings.bounds.y).toBeGreaterThanOrEqual(VIDEO_RECT_PHONE.h);
+    expect(settings.bounds.w).toBeGreaterThanOrEqual(44);
+    expect(settings.bounds.h).toBeGreaterThanOrEqual(44);
+    tapNode(runtime, scene, settings);
+    expect(runtime.route()).toBe("settings");
+    expect(sceneTexts(runtime)).toContain("Playlist URL");
+    expect(calls).toEqual([`rect:${2 * designWidth},0,1,1`]);
+
+    pressButton(runtime, "Back to player");
+    expect(runtime.route()).toBe("player");
+    expect(calls).toEqual([`rect:${2 * designWidth},0,1,1`, "rect:0,0,390,219"]);
+  });
+
+  test("phone Settings imports an extensionless JSON URL and keeps the last lineup on failure", async () => {
+    const url = "https://example.invalid/channel-list";
+    const stream = "https://example.invalid/imported.m3u8";
+    const replies = { fetchText: `\uFEFF${JSON.stringify({ channels: [{ title: "Imported news", url: stream }] })}` };
+    const { media, calls } = fakeMedia(replies);
+    const pending = Promise.withResolvers<void>();
+    const fetchText = media.fetchText;
+    media.fetchText = async (source) => {
+      const response = await fetchText(source);
+      await pending.promise;
+      return response;
+    };
+    const runtime = new TvplayerRuntime({ media, formFactor: "phone" });
+
+    pressButton(runtime, "Settings");
+    pressButton(runtime, "Load playlist");
+    expect(sceneTexts(runtime).join(" ")).toContain("Failed: enter a playlist URL first");
+    expect(calls.some((call) => call.startsWith("fetch:"))).toBe(false);
+
+    const { scene } = runtime.render();
+    const fieldNode = scene.semantics?.nodes.find((node) => node.id === "playlist-url");
+    expect(fieldNode?.role).toBe("textfield");
+    tapNode(runtime, scene, fieldNode!);
+    const field = runtime.render().scene.ops.find((op) => op.op === "text-input" && op.id === "playlist-url");
+    if (field?.op !== "text-input") throw new Error("Settings did not render its URL field");
+    expect(field.focused).toBe(true);
+    runtime.dispatch("TEXT_EDIT", {
+      id: field.id, sessionId: field.sessionId, baseRevision: field.revision,
+      revision: field.revision + 1, text: url,
+      selection: { base: url.length, extent: url.length }, composing: null,
+    });
+    pressButton(runtime, "Load playlist");
+    expect(sceneTexts(runtime)).toContain("Loading playlist…");
+    const loadingButton = button(runtime.render().scene, "Load playlist");
+    expect(loadingButton.state?.disabled).toBe(true);
+    expect(loadingButton.actions).toBeUndefined();
+    expect(calls.filter((call) => call.startsWith("fetch:"))).toEqual([`fetch:${url}`]);
+
+    pending.resolve();
+    await settle();
+    expect(runtime.route()).toBe("player");
+    expect(calls).toContain(`prepare:${stream}`);
+    expect(sceneTexts(runtime)).toContain("Imported news");
+    expect(sceneTexts(runtime)).not.toContain(FIRST.title);
+
+    replies.fetchText = "{malformed JSON";
+    calls.length = 0;
+    pressButton(runtime, "Settings");
+    pressButton(runtime, "Load playlist");
+    await settle();
+    expect(runtime.route()).toBe("settings");
+    expect(sceneTexts(runtime).join(" ")).toContain("Failed: playlist parsed to zero channels");
+    expect(calls.filter((call) => !call.startsWith("rect:"))).toEqual([`fetch:${url}`]);
+    pressButton(runtime, "Back to player");
+    expect(sceneTexts(runtime)).toContain("Imported news");
+  });
+
   test("phone: tapping a channel row plays it through the real TAP dispatch", async () => {
     const { media, calls } = fakeMedia();
     const runtime = new TvplayerRuntime({ media, formFactor: "phone" });
     await settle();
     calls.length = 0;
 
-    // The committed scene's tap regions, in row order; the phone layout
-    // registers exactly one tap per visible channel row.
+    // The committed scene's tap regions register in tree order.
     const scene = (runtime.render() as unknown as {
       scene: { taps?: { payload?: { id?: unknown } }[] };
     }).scene;
     const taps = scene.taps ?? [];
     expect(taps.length).toBeGreaterThan(1);
-    // Phone taps: the group chips come first (All + one per group),
-    // then the visible channel rows.
-    const chips = 1 + GROUPS.length;
-    const thirdRowTapId = taps[chips + 2]!.payload!.id;
+    // Hero, search, Settings, then up to 4 category chips, and two taps
+    // per channel row (play body and favorite star).
+    const prefix = 3 + Math.min(4, 2 + GROUPS.length);
+    const tapsPerRow = 2;
+    const thirdRowTapId = taps[prefix + 2 * tapsPerRow]!.payload!.id;
     runtime.dispatch("TAP", { id: thirdRowTapId });
     await settle();
 

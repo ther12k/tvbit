@@ -271,6 +271,9 @@ grep -E "tenun_app.js|libtenun_android" "$OUT_DIR/apk_contents.txt" || true
 if ! grep -q "assets/tenun_app.js" "$OUT_DIR/apk_contents.txt"; then
   accept_fail "packaged APK does not contain assets/tenun_app.js — the JS application cannot load"
 fi
+if grep -Eq 'assets/(gallery|polytron|tvplayer)_app\.js$' "$OUT_DIR/apk_contents.txt"; then
+  accept_fail "acceptance APK must not contain a demo bundle that takes precedence over assets/tenun_app.js"
+fi
 # Packaged-only JavaScript control: acceptance must not carry development
 # reload assets. dev_server.txt (LAN hot-reload endpoint) and
 # update_channel.json (OTA manifest URL) are dev-machine-local and absent
@@ -288,13 +291,13 @@ echo "reload mode: packaged-only (dev_server.txt and update_channel.json asserte
 STD_SHA_PUSH="$(sha256sum "$STD_APK" | awk '{print $1}')"
 echo "standard APK (pushed) sha256: $STD_SHA_PUSH"
 
-echo "== 6. Standard suite: :app:connectedDebugAndroidTest on the booted emulator =="
+echo "== 6. Standard suite: :app:connectedTouchDebugAndroidTest on the booted emulator =="
 # VariantCustomizationTest is excluded here: it can only run against the
 # JS-only variant APK in stage 9 (am instrument), never against the standard
 # build — a failure there would be by construction, not by defect.
 # OverlayInteractionTest likewise needs the gallery-bundle APK from stage 10;
 # FailVisibleTest needs the injection build from stage 11.
-if ! ./gradlew :app:connectedDebugAndroidTest \
+if ! ./gradlew :app:connectedTouchDebugAndroidTest \
   -Pandroid.testInstrumentationRunnerArguments.notClass="$APP_ID.VariantCustomizationTest,$APP_ID.OverlayInteractionTest,$APP_ID.FailVisibleTest" \
   >"$OUT_DIR/connected_debug_android_test.txt" 2>&1; then
   tail -80 "$OUT_DIR/connected_debug_android_test.txt"
@@ -309,7 +312,7 @@ if ! ./gradlew :app:connectedDebugAndroidTest \
   find "$SCRIPT_DIR/app/build/outputs" -name 'logcat-*.txt' -exec cp {} "$OUT_DIR/" \; 2>/dev/null || true
   "$ADB" shell dumpsys meminfo "$APP_ID" >"$OUT_DIR/meminfo_on_failure.txt" 2>&1 || true
   "$ADB" shell dumpsys procstats --hours 1 "$APP_ID" >"$OUT_DIR/procstats_on_failure.txt" 2>&1 || true
-  accept_fail ":app:connectedDebugAndroidTest failed"
+  accept_fail ":app:connectedTouchDebugAndroidTest failed"
 fi
 tail -12 "$OUT_DIR/connected_debug_android_test.txt"
 
@@ -399,7 +402,7 @@ mv "$VAR_APK.aligned" "$VAR_APK"
 # Sign with the SAME keystore AGP used for the standard and test APKs:
 # instrumentation requires the test package's signature to match its target.
 # Ask Gradle where its debug keystore is instead of guessing a path.
-DEBUG_KS="$(./gradlew -q :app:signingReport --console=plain 2>/dev/null | awk '/Variant: debug/{f=1; next} f && $1 == "Store:" {print $2; exit}' || true)"
+DEBUG_KS="$(./gradlew -q :app:signingReport --console=plain 2>/dev/null | awk '/^Variant: touchDebug$/{f=1; next} f && $1 == "Store:" {print $2; exit}' || true)"
 if [ -z "$DEBUG_KS" ] || [ ! -f "$DEBUG_KS" ]; then
   DEBUG_KS="$HOME/.android/debug.keystore"
 fi
@@ -433,7 +436,7 @@ echo "variant APK (pulled from device) sha256: $VAR_SHA_PULLED"
 [ "$VAR_SHA_PUSH" = "$VAR_SHA_PULLED" ] || accept_fail "installed variant artifact identity mismatch: pushed=$VAR_SHA_PUSH pulled=$VAR_SHA_PULLED"
 
 echo "== 9. Variant suite: JS-only customization observed on screen (am instrument) =="
-# AGP uninstalls both packages after connectedDebugAndroidTest, so the
+# AGP uninstalls both packages after connectedTouchDebugAndroidTest, so the
 # instrumentation APK must be installed again against the variant app.
 if ! "$ADB" install -r "$TEST_APK" >"$OUT_DIR/adb_install_variant_test.txt" 2>&1; then
   tail -10 "$OUT_DIR/adb_install_variant_test.txt"
@@ -649,7 +652,7 @@ cat >"$OUT_DIR/summary.json" <<EOF
   },
   "standard_apk_sha256_pushed": "$STD_SHA_PUSH",
   "standard_apk_sha256_pulled_from_device": "$STD_SHA_PULLED",
-  "standard_suite": {"executed": $SUM_TESTS, "failures": $SUM_FAILURES, "errors": $SUM_ERRORS, "skipped": $SUM_SKIPPED, "runner": "gradlew :app:connectedDebugAndroidTest"},
+  "standard_suite": {"executed": $SUM_TESTS, "failures": $SUM_FAILURES, "errors": $SUM_ERRORS, "skipped": $SUM_SKIPPED, "runner": "gradlew :app:connectedTouchDebugAndroidTest"},
   "variant_apk_sha256_pushed": "$VAR_SHA_PUSH",
   "variant_apk_sha256_pulled_from_device": "$VAR_SHA_PULLED",
   "variant_suite": {"executed": 1, "failures": 0, "runner": "adb shell am instrument -e class VariantCustomizationTest"},
@@ -675,5 +678,5 @@ echo "  variant APK:  $VAR_SHA_PULLED"
 echo "  overlay APK:  $OVL_SHA_PULLED (gallery bundle $GALLERY_SHA, built from the reviewed revision)"
 echo "  injection APK: $INJ_SHA_PULLED (test-only init-failure injection build)"
 echo "  reload mode:  packaged-only (dev_server.txt and update_channel.json asserted absent)"
-echo "  executed tests: standard=6 (0 failures/0 errors/0 skipped), variant=1 (OK), overlay=1 (OK), fail-visible=4 (OK)"
+echo "  executed tests: standard=$SUM_TESTS (0 failures/0 errors/0 skipped), variant=1 (OK), overlay=1 (OK), fail-visible=4 (OK)"
 echo "  evidence: $OUT_DIR"

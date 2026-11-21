@@ -152,29 +152,23 @@ export async function buildShowcasePreviewArtifacts(): Promise<ShowcasePreviewAr
 
 function smokeRun(code: string, filename: string, expected: string[] = []): void {
   const committed: string[] = [];
-  const host = globalThis as Record<string, unknown>;
-  host.tenun_commit = (json: string) => committed.push(json);
-  delete host.__tenun_last_scene;
-  delete host.__tenun_dispatch_action;
-  try {
-    vm.runInThisContext(code, { filename });
-    const raw = committed.at(-1) ?? (host.__tenun_last_scene as string | undefined) ?? "null";
-    const scene = JSON.parse(raw);
-    if (!scene || scene.tenun !== "display-list") {
-      throw new Error("smoke run failed: bundle did not commit a display-list scene");
+  const host: Record<string, unknown> = {
+    tenun_commit: (json: string) => committed.push(json),
+  };
+  // Start with QuickJS-like globals so an app's recurring timers can't keep Bun alive.
+  vm.runInNewContext(code, host, { filename });
+  const raw = committed.at(-1) ?? (host.__tenun_last_scene as string | undefined) ?? "null";
+  const scene = JSON.parse(raw);
+  if (!scene || scene.tenun !== "display-list") {
+    throw new Error("smoke run failed: bundle did not commit a display-list scene");
+  }
+  if (typeof host.__tenun_dispatch_action !== "function") {
+    throw new Error("smoke run failed: __tenun_dispatch_action not installed");
+  }
+  for (const needle of expected) {
+    if (!raw.includes(needle)) {
+      throw new Error(`smoke run failed: committed scene lacks ${JSON.stringify(needle)}`);
     }
-    if (typeof host.__tenun_dispatch_action !== "function") {
-      throw new Error("smoke run failed: __tenun_dispatch_action not installed");
-    }
-    for (const needle of expected) {
-      if (!raw.includes(needle)) {
-        throw new Error(`smoke run failed: committed scene lacks ${JSON.stringify(needle)}`);
-      }
-    }
-  } finally {
-    delete host.tenun_commit;
-    delete host.__tenun_dispatch_action;
-    delete host.__tenun_last_scene;
   }
 }
 
@@ -240,9 +234,16 @@ export async function buildPolytronBundle(): Promise<BundleArtifact> {
 /**
  * Builds the TN-196 NusaTV bundle: the TvplayerRuntime composition
  * (screens + media host-service bridge + KEY focus path) through the
- * public host-handoff contract, as the tv flavor's bundled APK asset.
+ * public host-handoff contract, as the flavor APKs' bundled asset.
+ *
+ * form "tv" (default) → the 10-foot layout the tv flavor boots.
+ * form "phone" → the 390-unit phone layout (video hero + tappable rows);
+ *   the phone flavor's asset. The form rides as a globalThis hint the entry
+ *   reads at boot — every other build path keeps the TV default.
  */
-export async function buildTvplayerBundle(): Promise<BundleArtifact> {
+export async function buildTvplayerBundle(
+  form: "tv" | "phone" = "tv"
+): Promise<BundleArtifact> {
   const result = await build({
     entrypoints: [tvplayerEntry],
     target: "browser",
@@ -254,10 +255,14 @@ export async function buildTvplayerBundle(): Promise<BundleArtifact> {
     throw new Error(`tvplayer bundle build failed:\n${result.logs.map(String).join("\n")}`);
   }
   let code = await result.outputs[0].text();
-  if (/^\s*(import|export)\s/m.test(code)) {
-    code = `(function(){\n${code}\n})();`;
+  // Always IIFE-wrap: this build emits no imports (external: []), and an
+  // unwrapped top-level declaration would leak into the smoke VM — a second
+  // build's smoke run in the same process then trips "duplicate variable".
+  code = `(function(){\n${code}\n})();`;
+  if (form === "phone") {
+    code = `globalThis.__TVPLAYER_FORM__="phone";\n${code}`;
   }
-  smokeRun(code, "tvplayer_app.js", ['NusaTV', 'Metro TV HD']);
+  smokeRun(code, `tvplayer_app.js(${form})`, ['NusaTV', 'Metro TV HD']);
   return {
     code,
     hash: crypto.createHash("sha256").update(code).digest("hex").slice(0, 16),

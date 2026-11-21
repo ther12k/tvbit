@@ -190,4 +190,14 @@ jobs:
       - name: Production integration mutation test
         run: python3 ./.github/scripts/verify-evidence.py --integration-mutation-test
       - name: Verify evidence packets
-        run: python3 ./.github/scripts/verify-evidence.py
+        run: |
+          # Cargo hashes the absolute path of the vendored Yoga dependency
+          # into the cdylib. Replay under the original TenunJS CI path even
+          # when this repository is checked out under a different name.
+          replay_root=/home/runner/work/tenunjs/tenunjs
+          if [ "$(pwd -P)" != "$replay_root" ]; then
+            mkdir -p "$(dirname "$replay_root")"
+            git worktree add --detach "$replay_root" HEAD
+          fi
+          cd "$replay_root"
+          python3 ./.github/scripts/verify-evidence.py
